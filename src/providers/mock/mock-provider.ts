@@ -8,8 +8,10 @@ import { HttpError, notFound } from '../../lib/errors.js';
 import { newId } from '../../lib/ids.js';
 import { isCurrency } from '../../lib/money.js';
 import {
+  type ChargeResult,
   type CreateCheckoutInput,
   type NormalizedEvent,
+  type OffSessionCharge,
   type PaymentProvider,
   type ProviderCheckout,
   WebhookSignatureError,
@@ -32,7 +34,20 @@ interface MockSessionRow {
   customer: string;
   return_url: string;
   status: 'open' | 'succeeded' | 'failed' | 'canceled';
+  save_payment_method: boolean;
 }
+
+/**
+ * The ways to pay on the hosted page. The two cards are saved for renewals
+ * (one is set up to decline then, for testing dunning); a mobile wallet, like
+ * JazzCash or Easypaisa, can't be charged later, so it renews by hand.
+ */
+const PAY_METHODS = {
+  pay: { label: 'Visa •••• 4242', saved: 'succeeds' },
+  'pay-failing-card': { label: 'Mastercard •••• 0341', saved: 'declines' },
+  'pay-wallet': { label: 'Mobile wallet', saved: null },
+} as const;
+type PayAction = keyof typeof PAY_METHODS;
 
 /** The provider's own webhook format, deliberately unlike our NormalizedEvent. */
 interface MockEvent {
@@ -47,6 +62,10 @@ interface MockEvent {
       amount: number;
       currency: string;
       failure_code: string | null;
+      customer: string;
+      /** Saved method that can be charged later, if the checkout asked to save one. */
+      payment_method: string | null;
+      payment_method_label: string | null;
     };
   };
 }
@@ -62,8 +81,9 @@ export function signMockPayload(
 
 /**
  * A stand-in payment provider. It has a hosted checkout page with Pay, Decline
- * and Cancel buttons, and sends HMAC-signed webhooks, so the rest of the system
- * runs exactly as it will against Stripe or JazzCash, without real money.
+ * and Cancel buttons, sends HMAC-signed webhooks, and charges saved cards for
+ * renewals, so the rest of the system runs exactly as it will against Stripe
+ * or JazzCash, without real money.
  */
 export class MockProvider implements PaymentProvider {
   readonly id = 'mock' as const;
@@ -84,8 +104,8 @@ export class MockProvider implements PaymentProvider {
     // finds the existing row instead of creating a second checkout.
     await db.query(
       `INSERT INTO mock_provider_sessions
-         (id, reference, amount_minor, currency, description, customer, return_url, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
+         (id, reference, amount_minor, currency, description, customer, return_url, status, save_payment_method)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8)
        ON CONFLICT (reference) DO NOTHING`,
       [
         newId('mps'),
@@ -95,6 +115,7 @@ export class MockProvider implements PaymentProvider {
         input.description,
         input.customerEmail,
         input.returnUrl,
+        input.savePaymentMethod,
       ],
     );
     const { rows } = await db.query<{ id: string }>(
@@ -136,6 +157,15 @@ export class MockProvider implements PaymentProvider {
           providerPaymentId: object.payment!,
           amountMinor: object.amount,
           currency: object.currency,
+          ...(object.payment_method_label
+            ? {
+                savedPaymentMethod: {
+                  customerRef: object.customer,
+                  paymentMethodRef: object.payment_method,
+                  label: object.payment_method_label,
+                },
+              }
+            : {}),
         };
       case 'payment.failed':
         return {
@@ -147,6 +177,41 @@ export class MockProvider implements PaymentProvider {
       default:
         return { id: event.id, type: 'ignored', providerType: String((event as { type: unknown }).type) };
     }
+  }
+
+  async chargeSavedPaymentMethod(input: OffSessionCharge, idempotencyKey: string): Promise<ChargeResult> {
+    const { db } = this.options;
+    const { rows: methods } = await db.query<{ id: string; behavior: 'succeeds' | 'declines' }>(
+      'SELECT id, behavior FROM mock_payment_methods WHERE id = $1',
+      [input.paymentMethodRef],
+    );
+    const method = methods[0];
+    if (!method) return { status: 'failed', reason: 'payment_method_missing' };
+
+    // Recorded under the idempotency key, so a retried call returns the first result.
+    const declined = method.behavior === 'declines';
+    await db.query(
+      `INSERT INTO mock_charges (id, idempotency_key, payment_method_id, amount_minor, currency, status, failure_code)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (idempotency_key) DO NOTHING`,
+      [
+        newId('mch'),
+        idempotencyKey,
+        method.id,
+        input.amountMinor,
+        input.currency,
+        declined ? 'failed' : 'succeeded',
+        declined ? 'insufficient_funds' : null,
+      ],
+    );
+    const { rows } = await db.query<{ id: string; status: string; failure_code: string | null }>(
+      'SELECT id, status, failure_code FROM mock_charges WHERE idempotency_key = $1',
+      [idempotencyKey],
+    );
+    const charge = rows[0]!;
+    return charge.status === 'succeeded'
+      ? { status: 'succeeded', providerPaymentId: charge.id }
+      : { status: 'failed', reason: charge.failure_code ?? 'card_declined' };
   }
 
   /** Hosted checkout pages, mounted at /mock-provider. */
@@ -163,13 +228,15 @@ export class MockProvider implements PaymentProvider {
           amountMinor: Number(session.amount_minor),
           currency: isCurrency(session.currency) ? session.currency : 'USD',
           status: session.status,
+          savePaymentMethod: session.save_payment_method,
         }),
       );
     });
 
     router.post('/checkout/:id/:action', async (req, res) => {
       const action = req.params.action;
-      const next = { pay: 'succeeded', decline: 'failed', cancel: 'canceled' }[action];
+      const paying = action in PAY_METHODS;
+      const next = paying ? 'succeeded' : { decline: 'failed', cancel: 'canceled' }[action];
       if (!next) throw new HttpError(404, 'not_found', `unknown action ${action}`);
 
       // Only an open session can move. A double-tapped Pay button finds it
@@ -179,7 +246,9 @@ export class MockProvider implements PaymentProvider {
         [req.params.id, next],
       );
       const moved = rows[0];
-      if (moved && moved.status !== 'canceled') this.emit(moved);
+      if (moved && moved.status !== 'canceled') {
+        await this.emit(moved, paying ? (action as PayAction) : null);
+      }
 
       const session = moved ?? (await this.findSession(req.params.id));
       const url = new URL(session.return_url);
@@ -195,8 +264,24 @@ export class MockProvider implements PaymentProvider {
     while (this.inFlight.size) await Promise.all([...this.inFlight]);
   }
 
-  private emit(session: MockSessionRow) {
+  private async emit(session: MockSessionRow, payAction: PayAction | null) {
     const succeeded = session.status === 'succeeded';
+
+    // Keep the payment method when the checkout asked for it.
+    let paymentMethod: string | null = null;
+    let paymentMethodLabel: string | null = null;
+    if (succeeded && payAction && session.save_payment_method) {
+      const method = PAY_METHODS[payAction];
+      paymentMethodLabel = method.label;
+      if (method.saved) {
+        paymentMethod = newId('mpm');
+        await this.options.db.query(
+          'INSERT INTO mock_payment_methods (id, customer, label, behavior) VALUES ($1, $2, $3, $4)',
+          [paymentMethod, session.customer, method.label, method.saved],
+        );
+      }
+    }
+
     const event: MockEvent = {
       id: newId('evt'),
       type: succeeded ? 'payment.succeeded' : 'payment.failed',
@@ -209,6 +294,9 @@ export class MockProvider implements PaymentProvider {
           amount: Number(session.amount_minor),
           currency: session.currency,
           failure_code: succeeded ? null : 'card_declined',
+          customer: session.customer,
+          payment_method: paymentMethod,
+          payment_method_label: paymentMethodLabel,
         },
       },
     };

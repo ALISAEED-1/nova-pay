@@ -2,6 +2,7 @@ import type { Queryable } from './db/index.js';
 import { HttpError, notFound } from './lib/errors.js';
 import { newId } from './lib/ids.js';
 import { type Currency, type Money, money } from './lib/money.js';
+import { type InvoiceRow, type InvoiceView, toInvoiceView } from './billing.js';
 import { regionFor } from './regions.js';
 import { type RentalView, activeRentals } from './rentals.js';
 
@@ -18,11 +19,25 @@ export interface SubscriptionView {
   planId: string;
   planName: string;
   quality: string;
-  /** `expired` is derived: the period ended and nothing renewed it (renewals arrive in Phase 4). */
-  status: 'active' | 'past_due' | 'canceled' | 'expired';
+  status: 'active' | 'past_due' | 'canceled';
+  /**
+   * Whether the plan lets the user watch right now: active, or past due but
+   * still inside the grace period. The app trusts this, not its own clock.
+   */
+  hasAccess: boolean;
   price: Money;
   currentPeriodStart: string;
   currentPeriodEnd: string;
+  /** Canceled by the customer; ends at `currentPeriodEnd` instead of renewing. */
+  cancelAtPeriodEnd: boolean;
+  /** While past due: when access stops unless the invoice is paid. */
+  graceUntil: string | null;
+  endedReason: string | null;
+  /** `automatic` charges a saved card; `manual` means the customer pays each period. */
+  renewal: 'automatic' | 'manual';
+  paymentMethod: string | null;
+  /** The next or overdue bill, if one is waiting. */
+  openInvoice: InvoiceView | null;
 }
 
 export interface AccountView {
@@ -42,6 +57,13 @@ interface SubscriptionRow {
   currency: Currency;
   current_period_start: Date;
   current_period_end: Date;
+  cancel_at_period_end: boolean;
+  grace_until: Date | null;
+  ended_reason: string | null;
+  provider: string | null;
+  provider_customer_ref: string | null;
+  payment_method_ref: string | null;
+  payment_method_label: string | null;
 }
 
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
@@ -87,13 +109,21 @@ export async function updateUser(
 export async function getAccount(db: Queryable, userId: string): Promise<AccountView> {
   const user = await findUser(db, userId);
   const { rows } = await db.query<SubscriptionRow>(
-    `SELECT s.id, s.plan_id, p.name AS plan_name, p.quality, s.status, s.amount_minor, s.currency,
-            s.current_period_start, s.current_period_end
+    `SELECT s.*, p.name AS plan_name, p.quality
      FROM subscriptions s JOIN plans p ON p.id = s.plan_id
      WHERE s.user_id = $1`,
     [userId],
   );
   const sub = rows[0];
+  const openInvoice = sub
+    ? (
+        await db.query<InvoiceRow>(
+          `SELECT * FROM invoices WHERE subscription_id = $1 AND status = 'open' ORDER BY period_start LIMIT 1`,
+          [sub.id],
+        )
+      ).rows[0]
+    : undefined;
+  const now = Date.now();
   return {
     user: {
       id: user.id,
@@ -108,11 +138,20 @@ export async function getAccount(db: Queryable, userId: string): Promise<Account
           planId: sub.plan_id,
           planName: sub.plan_name,
           quality: sub.quality,
-          status:
-            sub.status === 'active' && sub.current_period_end.getTime() <= Date.now() ? 'expired' : sub.status,
+          status: sub.status,
+          hasAccess:
+            sub.status === 'active' ||
+            (sub.status === 'past_due' && sub.grace_until !== null && sub.grace_until.getTime() > now),
           price: money(Number(sub.amount_minor), sub.currency),
           currentPeriodStart: sub.current_period_start.toISOString(),
           currentPeriodEnd: sub.current_period_end.toISOString(),
+          cancelAtPeriodEnd: sub.cancel_at_period_end,
+          graceUntil: sub.grace_until?.toISOString() ?? null,
+          endedReason: sub.ended_reason,
+          renewal:
+            sub.payment_method_ref || (sub.provider === 'stripe' && sub.provider_customer_ref) ? 'automatic' : 'manual',
+          paymentMethod: sub.payment_method_label,
+          openInvoice: openInvoice ? toInvoiceView(openInvoice) : null,
         }
       : null,
     rentals: await activeRentals(db, userId),
@@ -120,4 +159,4 @@ export async function getAccount(db: Queryable, userId: string): Promise<Account
 }
 
 /** True while the user's subscription lets them watch everything. */
-export const hasActivePlan = (account: AccountView) => account.subscription?.status === 'active';
+export const hasActivePlan = (account: AccountView) => account.subscription?.hasAccess === true;

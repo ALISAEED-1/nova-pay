@@ -3,9 +3,11 @@ import type { IncomingHttpHeaders } from 'node:http';
 import Stripe from 'stripe';
 
 import {
+  type ChargeResult,
   type CheckoutOutcome,
   type CreateCheckoutInput,
   type NormalizedEvent,
+  type OffSessionCharge,
   type PaymentProvider,
   type ProviderCheckout,
   WebhookSignatureError,
@@ -62,9 +64,10 @@ export class StripeProvider implements PaymentProvider {
         metadata: { reference: input.reference },
         payment_intent_data: {
           metadata: { reference: input.reference },
-          // Keeps the card for off-session renewals (Phase 4).
+          // Keeps the card on a Stripe customer for off-session renewals.
           ...(input.savePaymentMethod ? { setup_future_usage: 'off_session' as const } : {}),
         },
+        ...(input.savePaymentMethod ? { customer_creation: 'always' as const } : {}),
         success_url: input.returnUrl,
         cancel_url: cancelUrl.toString(),
         expires_at: Math.floor(Date.now() / 1000) + CHECKOUT_LIFETIME_SECONDS,
@@ -118,10 +121,51 @@ export class StripeProvider implements PaymentProvider {
     return this.toOutcome(session, `status-${session.id}`);
   }
 
+  /**
+   * Charges the customer's saved card for a renewal. The card itself is looked
+   * up from the customer, since the checkout webhook only names the customer.
+   */
+  async chargeSavedPaymentMethod(input: OffSessionCharge, idempotencyKey: string): Promise<ChargeResult> {
+    if (!input.customerRef) return { status: 'failed', reason: 'payment_method_missing' };
+    let paymentMethod = input.paymentMethodRef;
+    if (!paymentMethod) {
+      const methods = await this.stripe.paymentMethods.list({ customer: input.customerRef, type: 'card', limit: 1 });
+      paymentMethod = methods.data[0]?.id ?? null;
+    }
+    if (!paymentMethod) return { status: 'failed', reason: 'payment_method_missing' };
+
+    try {
+      const intent = await this.stripe.paymentIntents.create(
+        {
+          amount: input.amountMinor,
+          currency: input.currency.toLowerCase(),
+          customer: input.customerRef,
+          payment_method: paymentMethod,
+          off_session: true,
+          confirm: true,
+          description: input.description,
+          metadata: { reference: input.reference },
+        },
+        { idempotencyKey: `charge-${idempotencyKey}` },
+      );
+      return intent.status === 'succeeded'
+        ? { status: 'succeeded', providerPaymentId: intent.id }
+        : { status: 'failed', reason: `payment_${intent.status}` };
+    } catch (err) {
+      // A decline or a bank asking for 3-D Secure is an answer, not an outage:
+      // the customer has to pay on-session (the "Pay now" link in the app).
+      if (err instanceof Stripe.errors.StripeCardError) {
+        return { status: 'failed', reason: err.decline_code ?? err.code ?? 'card_declined' };
+      }
+      throw err;
+    }
+  }
+
   private toOutcome(session: Stripe.Checkout.Session, eventId: string): CheckoutOutcome | null {
     if (session.payment_status !== 'paid') return null;
     const paymentIntent =
       typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
+    const customer = typeof session.customer === 'string' ? session.customer : session.customer?.id;
     return {
       id: eventId,
       type: 'checkout.paid',
@@ -129,6 +173,7 @@ export class StripeProvider implements PaymentProvider {
       providerPaymentId: paymentIntent ?? session.id,
       amountMinor: session.amount_total ?? 0,
       currency: (session.currency ?? '').toUpperCase(),
+      ...(customer ? { savedPaymentMethod: { customerRef: customer, paymentMethodRef: null, label: 'Card (Stripe)' } } : {}),
     };
   }
 }

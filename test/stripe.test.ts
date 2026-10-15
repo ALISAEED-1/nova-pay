@@ -1,111 +1,24 @@
-import Stripe from 'stripe';
 import request from 'supertest';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import { loadConfig } from '../src/config.js';
-import { StripeProvider } from '../src/providers/stripe/stripe-provider.js';
+import { FakeStripeApi, STRIPE_WEBHOOK_SECRET, signedStripeEvent } from './fake-stripe.js';
 import { PUBLIC_BASE_URL, createTestContext } from './helpers.js';
 
-const STRIPE_WEBHOOK_SECRET = 'whsec_stripe_test';
-
-interface FakeSession {
-  id: string;
-  object: 'checkout.session';
-  url: string;
-  status: 'open' | 'complete' | 'expired';
-  payment_status: 'paid' | 'unpaid';
-  amount_total: number;
-  currency: string;
-  payment_intent: string | null;
-  client_reference_id: string | null;
-}
-
-/**
- * Plays Stripe's API over the SDK's fetch hook: it records what we send and
- * answers the two calls the adapter makes. No network, no Stripe account.
- */
-class FakeStripeApi {
-  readonly sessions = new Map<string, FakeSession>();
-  readonly created: { params: URLSearchParams; idempotencyKey: string | null }[] = [];
-  private readonly byIdempotencyKey = new Map<string, string>();
-
-  readonly fetch: typeof fetch = async (input, init) => {
-    const url = new URL(String(input));
-    const headers = new Headers(init?.headers);
-    let body: unknown;
-
-    if (init?.method === 'POST' && url.pathname === '/v1/checkout/sessions') {
-      const params = new URLSearchParams(String(init.body ?? ''));
-      const key = headers.get('idempotency-key');
-      const existing = key && this.byIdempotencyKey.get(key);
-      if (existing) {
-        body = this.sessions.get(existing);
-      } else {
-        this.created.push({ params, idempotencyKey: key });
-        const id = `cs_test_${this.created.length}`;
-        const session: FakeSession = {
-          id,
-          object: 'checkout.session',
-          url: `https://checkout.stripe.com/c/pay/${id}`,
-          status: 'open',
-          payment_status: 'unpaid',
-          amount_total: Number(params.get('line_items[0][price_data][unit_amount]')),
-          currency: params.get('line_items[0][price_data][currency]') ?? '',
-          payment_intent: null,
-          client_reference_id: params.get('client_reference_id'),
-        };
-        this.sessions.set(id, session);
-        if (key) this.byIdempotencyKey.set(key, id);
-        body = session;
-      }
-    } else if (init?.method === 'GET' && url.pathname.startsWith('/v1/checkout/sessions/')) {
-      body = this.sessions.get(url.pathname.split('/').pop()!);
-    }
-
-    return body
-      ? new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
-      : new Response(JSON.stringify({ error: { message: 'not found' } }), { status: 404 });
-  };
-
-  /** The customer pays on Stripe's page. */
-  pay(id: string) {
-    Object.assign(this.sessions.get(id)!, {
-      status: 'complete',
-      payment_status: 'paid',
-      payment_intent: `pi_${id}`,
-    });
-  }
-}
-
 const fakeApi = new FakeStripeApi();
-const signer = new Stripe('sk_test_signer');
 let ctx: Awaited<ReturnType<typeof createTestContext>>;
 
 beforeAll(async () => {
-  ctx = await createTestContext({
-    providers: [
-      new StripeProvider({
-        secretKey: 'sk_test_fake',
-        webhookSecret: STRIPE_WEBHOOK_SECRET,
-        httpClient: Stripe.createFetchHttpClient(fakeApi.fetch),
-      }),
-    ],
-  });
+  ctx = await createTestContext({ providers: [fakeApi.provider()] });
 });
 
 /** Sends a Stripe event about one of the fake sessions, signed like Stripe does. */
 const sendStripeEvent = (type: string, sessionId: string, eventId = `evt_${Math.random()}`, secret = STRIPE_WEBHOOK_SECRET) => {
-  const payload = JSON.stringify({
-    id: eventId,
-    object: 'event',
-    type,
-    created: Math.floor(Date.now() / 1000),
-    data: { object: fakeApi.sessions.get(sessionId) },
-  });
+  const { payload, signature } = signedStripeEvent(type, fakeApi.sessions.get(sessionId), eventId, secret);
   return request(ctx.app)
     .post('/v1/webhooks/stripe')
     .set('content-type', 'application/json')
-    .set('stripe-signature', signer.webhooks.generateTestHeaderString({ payload, secret }))
+    .set('stripe-signature', signature)
     .send(payload);
 };
 

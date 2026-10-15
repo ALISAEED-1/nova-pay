@@ -42,8 +42,29 @@ Nova Cinema app ──► nova-pay ──► payment provider (hosted checkout p
 - **Versioned schema migrations** (`schema_migrations`), so existing databases
   upgrade in place
 
-Coming next: JazzCash or Safepay for Pakistan, renewals and dunning, a
-double-entry ledger, reconciliation and an admin dashboard.
+**Phase 4: renewals, dunning, grace and cancel**
+- A **billing job** (every minute, idempotent) that raises each period's
+  invoice 3 days early, at the price the customer locked in
+- **Two ways to renew**:
+  - **Automatic:** a saved card is charged off-session on the due date (mock
+    cards, or a Stripe customer's card)
+  - **Manual:** for mobile wallets like JazzCash or Easypaisa, which can't be
+    charged later; the customer pays the open invoice from the app
+- **Dunning:** a declined card is retried after 1, 3 and 5 days. The plan goes
+  `past_due` but keeps working through a **7-day grace period**, then ends.
+  Each attempt's idempotency key carries its number, so a crash after charging
+  can't charge twice.
+- **Pay now:** any open invoice can be paid through a checkout, which also
+  replaces the saved card; paying late carries the subscription on from where it was
+- **Cancel / resume:** an active plan runs to the end of the paid period; a
+  past-due plan ends at once. Resume restores the renewal invoice.
+- A `billing_events` log (reminder, payment failed, renewed, ended): the
+  emails a production system would send
+- **Dev clock:** `POST /v1/dev/advance-clock {days}` moves one account's dates
+  forward and runs billing, so a demo can show a month passing. Off in production.
+
+Coming next: JazzCash or Safepay for Pakistan, refunds, proration on plan
+changes, a double-entry ledger, reconciliation and an admin dashboard.
 
 ## Run it
 
@@ -53,7 +74,7 @@ an embedded Postgres ([PGlite](https://pglite.dev)) stored in `./data/pglite`.
 ```bash
 npm install
 npm start            # http://localhost:4000
-npm test             # 35 tests: checkout, rentals, Stripe, webhooks, migrations
+npm test             # 49 tests: checkout, rentals, renewals, dunning, Stripe, webhooks, migrations
 npm run typecheck
 ```
 
@@ -63,8 +84,15 @@ To point the phone at it over USB:
 adb reverse tcp:4000 tcp:4000
 ```
 
-Demo accounts for testing on a phone (local development database only):
-`demo@example.com` / `demo1234` has a plan; `renter@example.com` / `demo1234` has none.
+Demo accounts for testing on a phone (local development database only), all
+with password `demo1234`:
+- `demo@example.com`: a plan that renews by hand
+- `renter@example.com`: no plan, one rental
+- `dunning@example.com`: a plan renewing on a saved Visa
+
+To see dunning on the test checkout page, pay with **Mastercard •••• 0341**,
+which works today but declines at renewal. Then use *Developer: skip ahead*
+in the app's Profile.
 
 Settings are in `.env` (see `.env.example`). Set `DATABASE_URL` to use a real
 Postgres server instead of PGlite.
@@ -98,9 +126,14 @@ neighbours get their own local providers.
 | GET | `/v1/regions` | Billing countries and their currencies |
 | GET | `/v1/plans` | Plans priced in the user's currency |
 | GET | `/v1/rentals/offer` | Rental price and length in the user's currency |
-| POST | `/v1/checkout/sessions` | `{planId}` or `{movieId, title}`; requires an `Idempotency-Key` header |
+| POST | `/v1/checkout/sessions` | `{planId}`, `{movieId, title}` or `{invoiceId}`; requires an `Idempotency-Key` header |
 | GET | `/v1/checkout/sessions/:id` | `open`, `paid` or `failed` (asks the provider while open) |
+| POST | `/v1/subscription/cancel` | Cancel at period end (or at once if past due) |
+| POST | `/v1/subscription/resume` | Undo a cancellation before the period ends |
+| GET | `/v1/subscription/invoices` | Billing history |
+| GET | `/v1/subscription/events` | Billing activity (reminders, failures, renewals) |
 | POST | `/v1/webhooks/:provider` | Signed provider events (`mock`, `stripe`) |
+| POST | `/v1/dev/advance-clock` | Dev only: `{days}` forward for this account, then run billing |
 
 ## Layout
 
@@ -112,6 +145,7 @@ src/
   plans.ts             price book lookups
   rentals.ts           rental pricing and active rentals
   checkout.ts          idempotent checkout sessions, status checks
+  billing.ts           the renewal job: invoices, charges, retries, grace, cancel
   webhooks.ts          verify → record → apply, in one transaction
   regions.ts           billing country → currency and provider preference
   providers/types.ts   the PaymentProvider interface every adapter implements

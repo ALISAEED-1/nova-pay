@@ -26,6 +26,16 @@ export interface ProviderCheckout {
   url: string;
 }
 
+/** How the customer paid, kept so later renewals can charge it. */
+export interface SavedPaymentMethod {
+  /** The provider's customer, when it has one (Stripe `cus_…`). */
+  customerRef: string | null;
+  /** A method that can be charged without the customer present, or null (wallets). */
+  paymentMethodRef: string | null;
+  /** For display: "Visa •••• 4242", "Mobile wallet". */
+  label: string;
+}
+
 /** A finished checkout, in our own vocabulary. */
 export type CheckoutOutcome =
   | {
@@ -35,6 +45,8 @@ export type CheckoutOutcome =
       providerPaymentId: string;
       amountMinor: number;
       currency: string;
+      /** Present when the checkout asked to keep the payment method. */
+      savedPaymentMethod?: SavedPaymentMethod;
     }
   | {
       id: string;
@@ -70,7 +82,27 @@ export interface PaymentProvider {
    * open. A safety net for a webhook that is late or never arrives.
    */
   fetchCheckoutOutcome?(providerSessionId: string): Promise<CheckoutOutcome | null>;
+  /**
+   * Charges a saved payment method with the customer absent (a renewal).
+   * Idempotent on `idempotencyKey`. A decline is a result, not an error; it
+   * throws only when the outcome is unknown, so the attempt can be retried.
+   */
+  chargeSavedPaymentMethod?(input: OffSessionCharge, idempotencyKey: string): Promise<ChargeResult>;
 }
+
+export interface OffSessionCharge {
+  customerRef: string | null;
+  paymentMethodRef: string | null;
+  amountMinor: number;
+  currency: Currency;
+  /** Our invoice id. */
+  reference: string;
+  description: string;
+}
+
+export type ChargeResult =
+  | { status: 'succeeded'; providerPaymentId: string }
+  | { status: 'failed'; reason: string };
 
 export class WebhookSignatureError extends Error {}
 

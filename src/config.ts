@@ -12,6 +12,10 @@ export interface Config {
   /** Stripe test-mode secret key. When absent, US/EU checkouts use the mock provider. */
   stripeSecretKey?: string;
   stripeWebhookSecret?: string;
+  /** How often the renewal job runs. */
+  billingIntervalMs: number;
+  /** Development helpers such as moving the billing clock. Off in production. */
+  devTools: boolean;
   logRequests: boolean;
 }
 
@@ -45,6 +49,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     pgliteDataDir: env.PGLITE_DATA_DIR || './data/pglite',
     stripeSecretKey,
     stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET || undefined,
+    billingIntervalMs: Number(env.BILLING_INTERVAL_MS ?? 60_000),
+    devTools: env.DEV_TOOLS ? env.DEV_TOOLS === 'true' && !production : !production,
     logRequests: env.LOG_REQUESTS !== 'false',
   };
 }

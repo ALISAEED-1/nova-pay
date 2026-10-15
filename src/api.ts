@@ -3,6 +3,13 @@ import { z } from 'zod';
 
 import { createUser, findUser, findUserByEmail, getAccount, updateUser } from './accounts.js';
 import { hashPassword, requireAuth, signToken, userIdOf, verifyPassword } from './auth/auth.js';
+import {
+  advanceClockForUser,
+  cancelSubscription,
+  listBillingEvents,
+  listInvoices,
+  resumeSubscription,
+} from './billing.js';
 import { createCheckoutSession, getCheckoutSession } from './checkout.js';
 import type { Db } from './db/index.js';
 import { HttpError } from './lib/errors.js';
@@ -17,6 +24,8 @@ export interface ApiDeps {
   providers: ProviderRegistry;
   jwtSecret: string;
   publicBaseUrl: string;
+  /** Enables /v1/dev routes (moving the billing clock). Never in production. */
+  devTools?: boolean;
 }
 
 const country = z
@@ -32,9 +41,10 @@ const registerBody = z.object({
 });
 const loginBody = z.object({ email: z.string().min(1), password: z.string().min(1) });
 const updateMeBody = z.object({ name: z.string().trim().min(1).max(60).optional(), country: country.optional() });
-/** `{planId}` buys a plan; `{movieId, title}` rents one title. */
+/** `{planId}` buys a plan, `{movieId, title}` rents one title, `{invoiceId}` pays a renewal. */
 const checkoutBody = z.union([
   z.object({ planId: z.string().min(1) }).transform((b) => ({ kind: 'subscription' as const, planId: b.planId })),
+  z.object({ invoiceId: z.string().min(1) }).transform((b) => ({ kind: 'renewal' as const, invoiceId: b.invoiceId })),
   z
     .object({
       movieId: z.string().regex(/^[a-z0-9_-]{1,64}$/, 'must be a catalogue id'),
@@ -117,6 +127,34 @@ export function apiRouter(deps: ApiDeps): Router {
   router.get('/checkout/sessions/:id', auth, async (req, res) => {
     res.json(await getCheckoutSession(deps, userIdOf(res), String(req.params.id)));
   });
+
+  router.post('/subscription/cancel', auth, async (_req, res) => {
+    await cancelSubscription(db, userIdOf(res));
+    res.json(await getAccount(db, userIdOf(res)));
+  });
+
+  router.post('/subscription/resume', auth, async (_req, res) => {
+    await resumeSubscription(db, userIdOf(res));
+    res.json(await getAccount(db, userIdOf(res)));
+  });
+
+  router.get('/subscription/invoices', auth, async (_req, res) => {
+    res.json({ invoices: await listInvoices(db, userIdOf(res)) });
+  });
+
+  router.get('/subscription/events', auth, async (_req, res) => {
+    res.json({ events: await listBillingEvents(db, userIdOf(res)) });
+  });
+
+  if (deps.devTools) {
+    const advanceBody = z.object({ days: z.number().int().min(1).max(400) });
+    // Development only: pretend `days` have passed for this user, then run billing.
+    router.post('/dev/advance-clock', auth, async (req, res) => {
+      const { days } = advanceBody.parse(req.body);
+      const report = await advanceClockForUser(deps, userIdOf(res), days);
+      res.json({ report, account: await getAccount(db, userIdOf(res)) });
+    });
+  }
 
   return router;
 }

@@ -36,6 +36,7 @@ export async function createTestContext(options: { providers?: PaymentProvider[]
     mockProvider,
     jwtSecret: 'test-secret',
     publicBaseUrl: PUBLIC_BASE_URL,
+    devTools: true,
   });
 
   let users = 0;
@@ -61,10 +62,45 @@ export async function createTestContext(options: { providers?: PaymentProvider[]
     checkout(token, { movieId, title }, key);
 
   /** Presses a button on the hosted checkout page, the way the customer would. */
-  const pressCheckoutButton = (checkoutUrl: string, action: 'pay' | 'decline' | 'cancel') =>
+  const pressCheckoutButton = (checkoutUrl: string, action: MockPageAction) =>
     request(app).post(`${new URL(checkoutUrl).pathname}/${action}`);
 
   const get = (path: string, token: string) => request(app).get(path).set('Authorization', `Bearer ${token}`);
+  const post = (path: string, token: string, body: object = {}) =>
+    request(app).post(path).set('Authorization', `Bearer ${token}`).send(body);
 
-  return { db, app, mockProvider, register, startCheckout, startRental, pressCheckoutButton, get };
+  /** Buys a plan through the mock provider's page with the chosen way of paying. */
+  const subscribe = async (token: string, planId: string, payWith: MockPageAction = 'pay') => {
+    const created = await startCheckout(token, planId);
+    if (created.status !== 201) throw new Error(`checkout failed: ${JSON.stringify(created.body)}`);
+    await pressCheckoutButton(created.body.checkoutUrl, payWith);
+    await mockProvider.flush();
+    return created.body;
+  };
+
+  /** Pays an open invoice through a checkout, as the app's "Pay now" does. */
+  const payInvoice = async (token: string, invoiceId: string, payWith: MockPageAction = 'pay') => {
+    const created = await checkout(token, { invoiceId });
+    if (created.status !== 201) return created;
+    await pressCheckoutButton(created.body.checkoutUrl, payWith);
+    await mockProvider.flush();
+    return created;
+  };
+
+  return {
+    db,
+    app,
+    providers,
+    mockProvider,
+    register,
+    startCheckout,
+    startRental,
+    pressCheckoutButton,
+    get,
+    post,
+    subscribe,
+    payInvoice,
+  };
 }
+
+export type MockPageAction = 'pay' | 'pay-failing-card' | 'pay-wallet' | 'decline' | 'cancel';

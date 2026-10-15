@@ -9,6 +9,7 @@ import {
   type ProviderRegistry,
   WebhookSignatureError,
 } from './providers/types.js';
+import { logBillingEvent, saveSubscriptionPaymentMethod, settleInvoice } from './billing.js';
 import { RENTAL_HOURS } from './rentals.js';
 
 export type WebhookOutcome = 'processed' | 'duplicate' | 'ignored';
@@ -68,9 +69,10 @@ export async function applyProviderEvent(
 interface SessionRow {
   id: string;
   user_id: string;
-  kind: 'subscription' | 'rental';
+  kind: 'subscription' | 'rental' | 'renewal';
   plan_id: string | null;
   movie_id: string | null;
+  invoice_id: string | null;
   item_title: string | null;
   amount_minor: number;
   currency: string;
@@ -82,7 +84,7 @@ async function applyEvent(tx: Queryable, provider: ProviderId, event: Normalized
   if (event.type === 'ignored') return `ignored provider event type ${event.providerType}`;
 
   const { rows } = await tx.query<SessionRow>(
-    `SELECT id, user_id, kind, plan_id, movie_id, item_title, amount_minor, currency, status
+    `SELECT id, user_id, kind, plan_id, movie_id, invoice_id, item_title, amount_minor, currency, status
      FROM checkout_sessions
      WHERE provider = $1 AND provider_session_id = $2
      FOR UPDATE`,
@@ -115,12 +117,27 @@ async function applyEvent(tx: Queryable, provider: ProviderId, event: Normalized
   }
 
   await tx.query(`UPDATE checkout_sessions SET status = 'paid', updated_at = now() WHERE id = $1`, [session.id]);
-  await tx.query(
-    `INSERT INTO payments
-       (id, user_id, checkout_session_id, amount_minor, currency, provider, provider_payment_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'succeeded')`,
-    [newId('pay'), session.user_id, session.id, session.amount_minor, session.currency, provider, event.providerPaymentId],
-  );
+
+  if (session.kind === 'renewal') {
+    const settled = await settleInvoice(
+      tx,
+      session.invoice_id!,
+      { provider, providerPaymentId: event.providerPaymentId, checkoutSessionId: session.id },
+      new Date(),
+      event.savedPaymentMethod,
+    );
+    if (settled) return `session paid, invoice ${session.invoice_id} settled`;
+    // The invoice was settled some other way (an automatic retry got there
+    // first), so this money was taken twice. Record it and flag a refund.
+    await recordPayment(tx, session, provider, event.providerPaymentId);
+    await logBillingEvent(tx, session.user_id, null, 'refund_needed', {
+      checkoutSessionId: session.id,
+      invoiceId: session.invoice_id,
+    });
+    return `invoice ${session.invoice_id} was already settled: refund needed`;
+  }
+
+  await recordPayment(tx, session, provider, event.providerPaymentId);
 
   if (session.kind === 'rental') {
     await tx.query(
@@ -141,8 +158,9 @@ async function applyEvent(tx: Queryable, provider: ProviderId, event: Normalized
     return `session paid, ${session.movie_id} rented for ${RENTAL_HOURS}h`;
   }
 
-  // Start (or switch to) the paid plan for one month from now, at the price paid.
-  await tx.query(
+  // Start (or switch to) the paid plan for one month from now, at the price
+  // paid. Buying a plan clears any cancellation, grace period or overdue bill.
+  const { rows: subs } = await tx.query<{ id: string }>(
     `INSERT INTO subscriptions
        (id, user_id, plan_id, status, amount_minor, currency, current_period_start, current_period_end)
      VALUES ($1, $2, $3, 'active', $4, $5, now(), now() + interval '1 month')
@@ -150,8 +168,32 @@ async function applyEvent(tx: Queryable, provider: ProviderId, event: Normalized
        plan_id = EXCLUDED.plan_id, status = 'active',
        amount_minor = EXCLUDED.amount_minor, currency = EXCLUDED.currency,
        current_period_start = EXCLUDED.current_period_start,
-       current_period_end = EXCLUDED.current_period_end, updated_at = now()`,
+       current_period_end = EXCLUDED.current_period_end,
+       cancel_at_period_end = false, canceled_at = NULL, ended_reason = NULL, grace_until = NULL,
+       updated_at = now()
+     RETURNING id`,
     [newId('sub'), session.user_id, session.plan_id, session.amount_minor, session.currency],
   );
+  const subscriptionId = subs[0]!.id;
+  await tx.query(
+    `UPDATE invoices SET status = 'void', next_attempt_at = NULL WHERE subscription_id = $1 AND status = 'open'`,
+    [subscriptionId],
+  );
+  await saveSubscriptionPaymentMethod(
+    tx,
+    subscriptionId,
+    provider,
+    event.savedPaymentMethod ?? { customerRef: null, paymentMethodRef: null, label: 'Paid once' },
+  );
+  await logBillingEvent(tx, session.user_id, subscriptionId, 'subscribed', { planId: session.plan_id });
   return `session paid, ${session.plan_id} subscription active`;
+}
+
+async function recordPayment(tx: Queryable, session: SessionRow, provider: ProviderId, providerPaymentId: string) {
+  await tx.query(
+    `INSERT INTO payments
+       (id, user_id, checkout_session_id, amount_minor, currency, provider, provider_payment_id, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'succeeded')`,
+    [newId('pay'), session.user_id, session.id, session.amount_minor, session.currency, provider, providerPaymentId],
+  );
 }

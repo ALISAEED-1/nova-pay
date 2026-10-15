@@ -1,4 +1,5 @@
 import { findUser, getAccount, hasActivePlan } from './accounts.js';
+import { findOpenInvoice } from './billing.js';
 import type { Db } from './db/index.js';
 import { HttpError, notFound } from './lib/errors.js';
 import { newId } from './lib/ids.js';
@@ -18,14 +19,17 @@ export interface CheckoutDeps {
 /** What a checkout buys. */
 export type CheckoutItem =
   | { kind: 'subscription'; planId: string }
-  | { kind: 'rental'; movieId: string; title: string };
+  | { kind: 'rental'; movieId: string; title: string }
+  /** Pays an open renewal invoice by hand: wallets, or after a failed card. */
+  | { kind: 'renewal'; invoiceId: string };
 
 export interface CheckoutSessionView {
   id: string;
-  kind: 'subscription' | 'rental';
+  kind: CheckoutItem['kind'];
   status: 'open' | 'paid' | 'failed';
   planId: string | null;
   movieId: string | null;
+  invoiceId: string | null;
   amount: Money;
   provider: string;
   /** Hosted payment page to open for the customer. */
@@ -38,9 +42,10 @@ export interface CheckoutSessionView {
 interface SessionRow {
   id: string;
   user_id: string;
-  kind: 'subscription' | 'rental';
+  kind: CheckoutItem['kind'];
   plan_id: string | null;
   movie_id: string | null;
+  invoice_id: string | null;
   item_title: string | null;
   amount_minor: number;
   currency: Currency;
@@ -60,6 +65,7 @@ const toView = (row: SessionRow, publicBaseUrl: string): CheckoutSessionView => 
   status: row.status,
   planId: row.plan_id,
   movieId: row.movie_id,
+  invoiceId: row.invoice_id,
   amount: money(Number(row.amount_minor), row.currency),
   provider: row.provider,
   checkoutUrl: row.checkout_url,
@@ -84,8 +90,9 @@ export async function createCheckoutSession(
 
   await db.query(
     `INSERT INTO checkout_sessions
-       (id, user_id, kind, plan_id, movie_id, item_title, amount_minor, currency, provider, status, idempotency_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10)
+       (id, user_id, kind, plan_id, movie_id, invoice_id, item_title, amount_minor, currency, provider, status,
+        idempotency_key)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open', $11)
      ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
     [
       newId('cs'),
@@ -93,6 +100,7 @@ export async function createCheckoutSession(
       input.item.kind,
       priced.planId,
       priced.movieId,
+      priced.invoiceId,
       priced.title,
       priced.price.amountMinor,
       priced.price.currency,
@@ -109,6 +117,7 @@ export async function createCheckoutSession(
     session.kind !== input.item.kind ||
     session.plan_id !== priced.planId ||
     session.movie_id !== priced.movieId ||
+    session.invoice_id !== priced.invoiceId ||
     Number(session.amount_minor) !== priced.price.amountMinor
   ) {
     throw new HttpError(409, 'idempotency_key_reused', 'This idempotency key was already used for a different checkout');
@@ -129,7 +138,8 @@ export async function createCheckoutSession(
         description: priced.description,
         customerEmail: user.email,
         returnUrl: returnUrlFor(publicBaseUrl, session.id),
-        savePaymentMethod: session.kind === 'subscription',
+        // Plans and renewals keep the payment method so the next renewal can be automatic.
+        savePaymentMethod: session.kind !== 'rental',
       },
       session.id,
     );
@@ -149,6 +159,7 @@ export async function createCheckoutSession(
 interface PricedItem {
   planId: string | null;
   movieId: string | null;
+  invoiceId: string | null;
   title: string | null;
   description: string;
   price: Money;
@@ -163,7 +174,28 @@ async function priceItem(
   if (item.kind === 'subscription') {
     const plan = await findPlan(deps.db, item.planId, currency);
     if (!plan) throw new HttpError(404, 'plan_not_found', `No plan "${item.planId}" in ${currency}`);
-    return { planId: plan.id, movieId: null, title: null, description: `${plan.name} plan, monthly`, price: plan.price };
+    return {
+      planId: plan.id,
+      movieId: null,
+      invoiceId: null,
+      title: null,
+      description: `${plan.name} plan, monthly`,
+      price: plan.price,
+    };
+  }
+
+  if (item.kind === 'renewal') {
+    // The invoice's own amount and currency: the price locked in when the plan started.
+    const invoice = await findOpenInvoice(deps.db, userId, item.invoiceId);
+    const plan = await findPlan(deps.db, invoice.plan_id, invoice.currency);
+    return {
+      planId: invoice.plan_id,
+      movieId: null,
+      invoiceId: invoice.id,
+      title: null,
+      description: `${plan?.name ?? invoice.plan_id} plan renewal`,
+      price: money(Number(invoice.amount_minor), invoice.currency),
+    };
   }
 
   // Renting makes no sense for something the user can already watch.
@@ -177,6 +209,7 @@ async function priceItem(
   return {
     planId: null,
     movieId: item.movieId,
+    invoiceId: null,
     title: item.title,
     description: `Rent "${item.title}" for ${RENTAL_HOURS} hours`,
     price: rentalOffer(currency).price,

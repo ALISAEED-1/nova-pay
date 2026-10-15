@@ -3,8 +3,8 @@ import express from 'express';
 import { apiRouter } from './api.js';
 import type { Db } from './db/index.js';
 import { errorHandler } from './lib/errors.js';
-import { page } from './lib/html.js';
 import type { MockProvider } from './providers/mock/mock-provider.js';
+import { returnPage } from './providers/mock/pages.js';
 import type { ProviderRegistry } from './providers/types.js';
 
 export interface AppDeps {
@@ -14,6 +14,7 @@ export interface AppDeps {
   jwtSecret: string;
   publicBaseUrl: string;
   logRequests?: boolean;
+  devTools?: boolean;
 }
 
 export function createApp(deps: AppDeps) {
@@ -43,16 +44,7 @@ export function createApp(deps: AppDeps) {
   // Where the provider returns the customer. The app intercepts this URL and
   // closes its checkout view; a plain browser lands on this page instead.
   app.get('/checkout/return', (req, res) => {
-    const canceled = req.query.canceled === '1';
-    res.type('html').send(
-      page(
-        'Back to Nova Cinema',
-        `<div class="card">
-          <h1>${canceled ? 'Checkout canceled' : 'Thanks! Finishing up…'}</h1>
-          <p class="muted">You can close this page and return to the Nova Cinema app.</p>
-        </div>`,
-      ),
-    );
+    res.type('html').send(returnPage(req.query.canceled === '1'));
   });
 
   app.use((_req, res) => {
