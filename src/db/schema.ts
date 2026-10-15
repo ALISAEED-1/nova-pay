@@ -1,8 +1,10 @@
 /**
- * Phase 1 schema. Idempotent, applied on every start. Amounts are BIGINT minor
- * units with a CHAR(3) currency beside them; there are no float money columns.
+ * Migration 1: the Phase 1 schema. Written with IF NOT EXISTS because
+ * databases created before migrations were tracked already have these tables.
+ * Amounts are BIGINT minor units with a CHAR(3) currency beside them; there are
+ * no float money columns.
  */
-export const SCHEMA = `
+export const INITIAL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id            TEXT PRIMARY KEY,
   email         TEXT NOT NULL UNIQUE,

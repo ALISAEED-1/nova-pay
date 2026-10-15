@@ -9,8 +9,11 @@ import type { PaymentProvider, ProviderId } from '../src/providers/types.js';
 export const PUBLIC_BASE_URL = 'http://pay.test';
 export const WEBHOOK_SECRET = 'whsec_test';
 
-/** A fresh in-memory database and app per test file. */
-export async function createTestContext() {
+/**
+ * A fresh in-memory database and app per test file. Extra providers (a Stripe
+ * adapter with a fake network layer) can be registered beside the mock one.
+ */
+export async function createTestContext(options: { providers?: PaymentProvider[] } = {}) {
   const db = await openDb({});
   await seedPlans(db);
 
@@ -25,9 +28,11 @@ export async function createTestContext() {
       if (response.status !== 200) throw new Error(`webhook answered ${response.status}`);
     },
   });
+  const providers = new Map<ProviderId, PaymentProvider>([['mock', mockProvider]]);
+  for (const provider of options.providers ?? []) providers.set(provider.id, provider);
   app = createApp({
     db,
-    providers: new Map<ProviderId, PaymentProvider>([['mock', mockProvider]]),
+    providers,
     mockProvider,
     jwtSecret: 'test-secret',
     publicBaseUrl: PUBLIC_BASE_URL,
@@ -43,12 +48,17 @@ export async function createTestContext() {
     return { token: response.body.token as string, email: `user${users}@example.com` };
   };
 
-  const startCheckout = (token: string, planId: string, key = `key-${Math.random()}`) =>
+  const checkout = (token: string, body: object, key = `key-${Math.random()}`) =>
     request(app)
       .post('/v1/checkout/sessions')
       .set('Authorization', `Bearer ${token}`)
       .set('Idempotency-Key', key)
-      .send({ planId });
+      .send(body);
+
+  const startCheckout = (token: string, planId: string, key?: string) => checkout(token, { planId }, key);
+
+  const startRental = (token: string, movieId: string, title = movieId, key?: string) =>
+    checkout(token, { movieId, title }, key);
 
   /** Presses a button on the hosted checkout page, the way the customer would. */
   const pressCheckoutButton = (checkoutUrl: string, action: 'pay' | 'decline' | 'cancel') =>
@@ -56,5 +66,5 @@ export async function createTestContext() {
 
   const get = (path: string, token: string) => request(app).get(path).set('Authorization', `Bearer ${token}`);
 
-  return { db, app, mockProvider, register, startCheckout, pressCheckoutButton, get };
+  return { db, app, mockProvider, register, startCheckout, startRental, pressCheckoutButton, get };
 }

@@ -9,6 +9,9 @@ export interface Config {
   databaseUrl?: string;
   /** PGlite data directory. When absent, the database lives in memory. */
   pgliteDataDir?: string;
+  /** Stripe test-mode secret key. When absent, US/EU checkouts use the mock provider. */
+  stripeSecretKey?: string;
+  stripeWebhookSecret?: string;
   logRequests: boolean;
 }
 
@@ -25,6 +28,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error('JWT_SECRET and MOCK_WEBHOOK_SECRET must be set in production');
   }
 
+  const stripeSecretKey = env.STRIPE_SECRET_KEY || undefined;
+  // This project only ever handles test money. Refuse a live key outright
+  // rather than risk charging a real card from a portfolio demo.
+  if (stripeSecretKey && !/^(sk|rk)_test_/.test(stripeSecretKey)) {
+    throw new Error('STRIPE_SECRET_KEY must be a test-mode key (sk_test_… or rk_test_…)');
+  }
+
   return {
     port,
     host: env.HOST || '127.0.0.1',
@@ -33,6 +43,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     mockWebhookSecret,
     databaseUrl: env.DATABASE_URL || undefined,
     pgliteDataDir: env.PGLITE_DATA_DIR || './data/pglite',
+    stripeSecretKey,
+    stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET || undefined,
     logRequests: env.LOG_REQUESTS !== 'false',
   };
 }

@@ -9,15 +9,11 @@ import {
   type ProviderRegistry,
   WebhookSignatureError,
 } from './providers/types.js';
+import { RENTAL_HOURS } from './rentals.js';
 
 export type WebhookOutcome = 'processed' | 'duplicate' | 'ignored';
 
-/**
- * The provider's word is the source of truth for whether money moved. Each
- * event is recorded and applied in one transaction: a redelivered event hits
- * the primary key and changes nothing, and a failure part-way rolls back so
- * the provider's retry can apply it cleanly.
- */
+/** Verifies a provider's webhook, then records and applies it. */
 export async function handleWebhook(
   deps: { db: Db; providers: ProviderRegistry },
   providerId: string,
@@ -36,19 +32,34 @@ export async function handleWebhook(
     }
     throw err;
   }
+  return applyProviderEvent(deps.db, provider.id, event, rawBody.toString('utf8'));
+}
 
-  return deps.db.transaction(async (tx) => {
+/**
+ * The provider's word is the source of truth for whether money moved. Each
+ * event is recorded and applied in one transaction: a redelivered event hits
+ * the primary key and changes nothing, and a failure part-way rolls back so
+ * the provider's retry can apply it cleanly. Used for webhooks and for direct
+ * status checks alike.
+ */
+export async function applyProviderEvent(
+  db: Db,
+  provider: ProviderId,
+  event: NormalizedEvent,
+  payload: string,
+): Promise<WebhookOutcome> {
+  return db.transaction(async (tx) => {
     const recorded = await tx.query(
       `INSERT INTO webhook_events (provider, event_id, type, payload) VALUES ($1, $2, $3, $4)
        ON CONFLICT (provider, event_id) DO NOTHING`,
-      [provider.id, event.id, event.type, rawBody.toString('utf8')],
+      [provider, event.id, event.type, payload],
     );
     if (recorded.rowCount === 0) return 'duplicate';
 
-    const note = await applyEvent(tx, provider.id, event);
+    const note = await applyEvent(tx, provider, event);
     await tx.query(
       `UPDATE webhook_events SET processed_at = now(), note = $3 WHERE provider = $1 AND event_id = $2`,
-      [provider.id, event.id, note],
+      [provider, event.id, note],
     );
     return event.type === 'ignored' ? 'ignored' : 'processed';
   });
@@ -57,7 +68,10 @@ export async function handleWebhook(
 interface SessionRow {
   id: string;
   user_id: string;
-  plan_id: string;
+  kind: 'subscription' | 'rental';
+  plan_id: string | null;
+  movie_id: string | null;
+  item_title: string | null;
   amount_minor: number;
   currency: string;
   status: 'open' | 'paid' | 'failed';
@@ -68,7 +82,8 @@ async function applyEvent(tx: Queryable, provider: ProviderId, event: Normalized
   if (event.type === 'ignored') return `ignored provider event type ${event.providerType}`;
 
   const { rows } = await tx.query<SessionRow>(
-    `SELECT id, user_id, plan_id, amount_minor, currency, status FROM checkout_sessions
+    `SELECT id, user_id, kind, plan_id, movie_id, item_title, amount_minor, currency, status
+     FROM checkout_sessions
      WHERE provider = $1 AND provider_session_id = $2
      FOR UPDATE`,
     [provider, event.providerSessionId],
@@ -106,6 +121,26 @@ async function applyEvent(tx: Queryable, provider: ProviderId, event: Normalized
      VALUES ($1, $2, $3, $4, $5, $6, $7, 'succeeded')`,
     [newId('pay'), session.user_id, session.id, session.amount_minor, session.currency, provider, event.providerPaymentId],
   );
+
+  if (session.kind === 'rental') {
+    await tx.query(
+      `INSERT INTO rentals
+         (id, user_id, movie_id, title, checkout_session_id, amount_minor, currency, starts_at, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now() + make_interval(hours => $8))`,
+      [
+        newId('rnt'),
+        session.user_id,
+        session.movie_id,
+        session.item_title ?? session.movie_id,
+        session.id,
+        session.amount_minor,
+        session.currency,
+        RENTAL_HOURS,
+      ],
+    );
+    return `session paid, ${session.movie_id} rented for ${RENTAL_HOURS}h`;
+  }
+
   // Start (or switch to) the paid plan for one month from now, at the price paid.
   await tx.query(
     `INSERT INTO subscriptions

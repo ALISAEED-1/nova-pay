@@ -9,6 +9,7 @@ import { HttpError } from './lib/errors.js';
 import { listPlans } from './plans.js';
 import type { ProviderRegistry } from './providers/types.js';
 import { FEATURED_COUNTRIES, regionFor } from './regions.js';
+import { rentalOffer } from './rentals.js';
 import { handleWebhook } from './webhooks.js';
 
 export interface ApiDeps {
@@ -31,7 +32,16 @@ const registerBody = z.object({
 });
 const loginBody = z.object({ email: z.string().min(1), password: z.string().min(1) });
 const updateMeBody = z.object({ name: z.string().trim().min(1).max(60).optional(), country: country.optional() });
-const checkoutBody = z.object({ planId: z.string().min(1) });
+/** `{planId}` buys a plan; `{movieId, title}` rents one title. */
+const checkoutBody = z.union([
+  z.object({ planId: z.string().min(1) }).transform((b) => ({ kind: 'subscription' as const, planId: b.planId })),
+  z
+    .object({
+      movieId: z.string().regex(/^[a-z0-9_-]{1,64}$/, 'must be a catalogue id'),
+      title: z.string().trim().min(1).max(120),
+    })
+    .transform((b) => ({ kind: 'rental' as const, movieId: b.movieId, title: b.title })),
+]);
 
 /** Everything under /v1. */
 export function apiRouter(deps: ApiDeps): Router {
@@ -89,13 +99,18 @@ export function apiRouter(deps: ApiDeps): Router {
     });
   });
 
+  router.get('/rentals/offer', auth, async (_req, res) => {
+    const user = await findUser(db, userIdOf(res));
+    res.json(rentalOffer(regionFor(user.country).currency));
+  });
+
   router.post('/checkout/sessions', auth, async (req, res) => {
     const idempotencyKey = req.header('Idempotency-Key');
     if (!idempotencyKey || idempotencyKey.length > 100) {
       throw new HttpError(400, 'idempotency_key_required', 'Send an Idempotency-Key header (max 100 chars)');
     }
-    const { planId } = checkoutBody.parse(req.body);
-    const session = await createCheckoutSession(deps, { userId: userIdOf(res), planId, idempotencyKey });
+    const item = checkoutBody.parse(req.body);
+    const session = await createCheckoutSession(deps, { userId: userIdOf(res), item, idempotencyKey });
     res.status(201).json(session);
   });
 

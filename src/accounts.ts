@@ -3,6 +3,7 @@ import { HttpError, notFound } from './lib/errors.js';
 import { newId } from './lib/ids.js';
 import { type Currency, type Money, money } from './lib/money.js';
 import { regionFor } from './regions.js';
+import { type RentalView, activeRentals } from './rentals.js';
 
 export interface UserRow {
   id: string;
@@ -27,6 +28,8 @@ export interface SubscriptionView {
 export interface AccountView {
   user: { id: string; name: string; email: string; country: string; currency: Currency };
   subscription: SubscriptionView | null;
+  /** Titles rented and still within their watch window. */
+  rentals: RentalView[];
 }
 
 interface SubscriptionRow {
@@ -112,5 +115,9 @@ export async function getAccount(db: Queryable, userId: string): Promise<Account
           currentPeriodEnd: sub.current_period_end.toISOString(),
         }
       : null,
+    rentals: await activeRentals(db, userId),
   };
 }
+
+/** True while the user's subscription lets them watch everything. */
+export const hasActivePlan = (account: AccountView) => account.subscription?.status === 'active';

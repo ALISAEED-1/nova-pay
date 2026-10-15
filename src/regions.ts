@@ -1,15 +1,17 @@
+import { HttpError } from './lib/errors.js';
 import type { Currency } from './lib/money.js';
-import type { ProviderId } from './providers/types.js';
+import type { PaymentProvider, ProviderId, ProviderRegistry } from './providers/types.js';
 
 /**
- * Which currency a customer pays in and which payment provider handles it,
- * decided by their billing country. Phase 1 routes every region to the mock
- * provider; later phases swap in Stripe (US/EU), JazzCash/Safepay (PK), etc.
+ * Which currency a customer pays in and which payment providers can take the
+ * payment, decided by their billing country. Providers are in order of
+ * preference; the first one configured on this server is used, so the US and
+ * EU fall back to the mock provider when no Stripe key is set.
  */
 export interface Region {
   id: 'US' | 'EU' | 'PK' | 'IN' | 'BD' | 'INTL';
   currency: Currency;
-  provider: ProviderId;
+  providers: readonly ProviderId[];
 }
 
 const EURO_AREA = new Set([
@@ -19,12 +21,22 @@ const EURO_AREA = new Set([
 
 export function regionFor(country: string): Region {
   const code = country.toUpperCase();
-  if (code === 'US') return { id: 'US', currency: 'USD', provider: 'mock' };
-  if (EURO_AREA.has(code)) return { id: 'EU', currency: 'EUR', provider: 'mock' };
-  if (code === 'PK') return { id: 'PK', currency: 'PKR', provider: 'mock' };
-  if (code === 'IN') return { id: 'IN', currency: 'INR', provider: 'mock' };
-  if (code === 'BD') return { id: 'BD', currency: 'BDT', provider: 'mock' };
-  return { id: 'INTL', currency: 'USD', provider: 'mock' };
+  if (code === 'US') return { id: 'US', currency: 'USD', providers: ['stripe', 'mock'] };
+  if (EURO_AREA.has(code)) return { id: 'EU', currency: 'EUR', providers: ['stripe', 'mock'] };
+  // JazzCash / Safepay, Razorpay and bKash adapters slot in here later.
+  if (code === 'PK') return { id: 'PK', currency: 'PKR', providers: ['mock'] };
+  if (code === 'IN') return { id: 'IN', currency: 'INR', providers: ['mock'] };
+  if (code === 'BD') return { id: 'BD', currency: 'BDT', providers: ['mock'] };
+  return { id: 'INTL', currency: 'USD', providers: ['mock'] };
+}
+
+/** The first of the region's providers that this server has configured. */
+export function pickProvider(region: Region, registry: ProviderRegistry): PaymentProvider {
+  for (const id of region.providers) {
+    const provider = registry.get(id);
+    if (provider) return provider;
+  }
+  throw new HttpError(503, 'provider_unavailable', `No payment provider is set up for ${region.id}`);
 }
 
 /** Countries offered in the app's billing-country picker. */

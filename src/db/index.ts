@@ -3,7 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
 
-import { SCHEMA } from './schema.js';
+import { migrate } from './migrations.js';
 
 export interface QueryResult<T> {
   rows: T[];
@@ -13,6 +13,8 @@ export interface QueryResult<T> {
 
 export interface Queryable {
   query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<QueryResult<T>>;
+  /** Runs a multi-statement script without parameters (migrations). */
+  exec(sql: string): Promise<void>;
 }
 
 /**
@@ -21,18 +23,19 @@ export interface Queryable {
  * real server. Both speak the same SQL.
  */
 export interface Db extends Queryable {
-  /** Runs a multi-statement script without parameters (migrations). */
-  exec(sql: string): Promise<void>;
   /** Runs `fn` in a transaction: commits if it resolves, rolls back if it throws. */
   transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T>;
   close(): Promise<void>;
 }
 
-export async function openDb(options: { databaseUrl?: string; pgliteDataDir?: string }): Promise<Db> {
+export async function openDb(
+  options: { databaseUrl?: string; pgliteDataDir?: string },
+  migrateOptions?: { upTo?: number },
+): Promise<Db> {
   const db = options.databaseUrl
     ? openPostgres(options.databaseUrl)
     : await openPglite(options.pgliteDataDir);
-  await db.exec(SCHEMA);
+  await migrate(db, migrateOptions);
   return db;
 }
 
@@ -40,17 +43,17 @@ async function openPglite(dataDir?: string): Promise<Db> {
   // PGlite creates only the last folder of the path itself.
   if (dataDir) await mkdir(dataDir, { recursive: true });
   const pglite = await PGlite.create(dataDir);
-  const wrap = (q: Pick<PGlite, 'query'>): Queryable => ({
+  const wrap = (q: Pick<PGlite, 'query' | 'exec'>): Queryable => ({
     query: async <T>(sql: string, params?: unknown[]) => {
       const result = await q.query<T>(sql, params);
       return { rows: result.rows, rowCount: result.rows.length || (result.affectedRows ?? 0) };
     },
+    exec: async (sql) => {
+      await q.exec(sql);
+    },
   });
   return {
     ...wrap(pglite),
-    exec: async (sql) => {
-      await pglite.exec(sql);
-    },
     transaction: (fn) => pglite.transaction((tx) => fn(wrap(tx))),
     close: () => pglite.close(),
   };
@@ -65,12 +68,12 @@ function openPostgres(connectionString: string): Db {
       const result = await client.query(sql, params);
       return { rows: result.rows as T[], rowCount: result.rowCount ?? result.rows.length };
     },
+    exec: async (sql) => {
+      await client.query(sql);
+    },
   });
   return {
     ...wrap(pool),
-    exec: async (sql) => {
-      await pool.query(sql);
-    },
     transaction: async (fn) => {
       const client = await pool.connect();
       try {

@@ -3,6 +3,7 @@ import { loadConfig } from './config.js';
 import { openDb } from './db/index.js';
 import { seedPlans } from './db/seed.js';
 import { MockProvider } from './providers/mock/mock-provider.js';
+import { StripeProvider } from './providers/stripe/stripe-provider.js';
 import type { PaymentProvider, ProviderId } from './providers/types.js';
 
 try {
@@ -27,6 +28,12 @@ const mockProvider = new MockProvider({
   },
 });
 const providers = new Map<ProviderId, PaymentProvider>([['mock', mockProvider]]);
+if (config.stripeSecretKey) {
+  providers.set(
+    'stripe',
+    new StripeProvider({ secretKey: config.stripeSecretKey, webhookSecret: config.stripeWebhookSecret }),
+  );
+}
 
 const app = createApp({
   db,
@@ -40,6 +47,10 @@ const app = createApp({
 const server = app.listen(config.port, config.host, () => {
   const storage = config.databaseUrl ? 'Postgres' : `PGlite at ${config.pgliteDataDir}`;
   console.log(`nova-pay listening on http://${config.host}:${config.port} (public ${config.publicBaseUrl}, ${storage})`);
+  console.log(`payment providers: ${[...providers.keys()].join(', ')}`);
+  if (config.stripeSecretKey && !config.stripeWebhookSecret) {
+    console.warn('STRIPE_WEBHOOK_SECRET is not set: Stripe payments are confirmed by status checks only');
+  }
 });
 
 const shutdown = () => {
